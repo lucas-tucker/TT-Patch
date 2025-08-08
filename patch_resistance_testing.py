@@ -16,18 +16,19 @@ import glob, os
 from jiwer import wer
 from tqdm import tqdm
 import pandas as pd
+from resistance_functions import mp3_compression # median_filter, moving_average_filter, outlier_removal, bandpass_filter
 
 WHISPER_MODEL = "base"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAMPLE_RATE = 16000
-CUTOFF = 30 * 16000  # 30 second cutoff size
-NOISE_LEVEL = 100
+CUTOFF = 30 * SAMPLE_RATE  # 30 second cutoff size
+TT_PATCH_SIZE = 0.64 * SAMPLE_RATE
 
-def apply_tt_patch(audio, verbose=True):
+def apply_tt_patch(audio, tt_patch, verbose=True):
 
-  segment_size = int(16000 * (30 - 0.64)) # Recall we use 16kHz sampling
+  segment_size = int(CUTOFF - TT_PATCH_SIZE) # Recall we use 16kHz sampling
 
-  # Split the audio into 30s - 0.64s size segments
+  # Split the audio into 30s - 0.64s == 29.36s size segments
   num_segments = int(len(audio) // segment_size)
   seek = 0
   adv_audio = torch.zeros((1,)).to(DEVICE)
@@ -37,7 +38,7 @@ def apply_tt_patch(audio, verbose=True):
       # Embed the patch randomly into each segment
       breakpoint = random.randint(0, min(segment_size, len(audio[seek:])))
       if verbose:
-        print(f"Inserting patch {patch_number} at {(seek + breakpoint) / 16000} seconds")
+        print(f"Inserting patch {patch_number} at {(seek + breakpoint) / SAMPLE_RATE} seconds")
       adv_audio = torch.cat((adv_audio,
                               audio[seek:seek + breakpoint],
                               tt_patch,
@@ -52,12 +53,12 @@ def apply_tt_patch(audio, verbose=True):
         adversarial_transcription = model.transcribe(adv_audio)["text"]
 
     print()
-    display(Audio(audio, autoplay=False, rate=16000))
+    display(Audio(audio, autoplay=False, rate=SAMPLE_RATE))
     print("Benign transcription:")
     print(original_transcription)
     print()
 
-    display(Audio(adv_audio, autoplay=False, rate=16000))
+    display(Audio(adv_audio, autoplay=False, rate=SAMPLE_RATE))
     print("Adversarial transcription:")
     print(adversarial_transcription)
     print()
@@ -84,46 +85,56 @@ test_dir = "/home-nfs/lwtucker/TT-Patch/tucker_attacks/src/data/librispeech-long
 # Grab the actual audio files, of which there should be 810; assume 16kHz sampling
 flac_files = glob.glob(os.path.join(test_dir, "**", "**", "*.flac"), recursive=True)
 
-segment_size = int(16000 * (30 - 0.64))
-wers = []
+segment_size = int(SAMPLE_RATE * (30 - 0.64))
+# wers = []
 
 testing_data_size = 5 # 800
-THRESHOLD = 15
+THRESHOLD = 15 # Threshold audio size
+FILTERS = {"none": lambda x: x, "mp3": mp3_compression} # {"none": lambda x: x, "median": median_filter, "moving avg": moving_average_filter, "outlier": outlier_removal, "bandpass": bandpass_filter}
+wers = {"none": [], "mp3": []} # {"none": [], "median": [], "moving avg": [], "outlier": [], "bandpass": []}
 num_empty_strings = 0
 num_under_threshold = 0
 
 for path in flac_files[:testing_data_size]:
     audio_sample, sr = torchaudio.load(path)
     audio_sample = audio_sample.squeeze().to(DEVICE) # Now a whisper-readable 1D tensor
-    adv_audio = apply_tt_patch(audio=audio_sample, verbose=False)
-    adv_audio += NOISE_LEVEL
-    with torch.no_grad():
-        original_transcription = model.transcribe(audio_sample)["text"]
-        adversarial_transcription = model.transcribe(adv_audio)["text"]
+    adv_audio = apply_tt_patch(audio=audio_sample, tt_patch=tt_patch, verbose=False)
 
-    num_under_threshold += len(adversarial_transcription) <= THRESHOLD
-    num_empty_strings += len(adversarial_transcription) == 0
+    for filter_name, filter in FILTERS.items():
+        filtered_adv_audio = filter(audio=audio_sample, verbose=False)
 
-    wers.append(wer(original_transcription.lower().strip(), adversarial_transcription.lower().strip()))
-    print(f"Original transcript: {original_transcription}")
-    print(f"Adversarial transcript: {adversarial_transcription}")
-    print(f"Avg WER thus far is {np.mean(wers)}")
+        with torch.no_grad():
+            original_transcription = model.transcribe(audio_sample)["text"]
+            adversarial_transcription = model.transcribe(filtered_adv_audio)["text"]
+        
+        wers[filter_name].append(wer(original_transcription.lower().strip(), adversarial_transcription.lower().strip()))
 
-plt.hist(wers, density=True, bins=10)
-plt.ylabel("Frequency")
-plt.xlabel("WER of Patch-attacked Long Audio Samples")
-plt.savefig("WER.png")
+    # num_under_threshold += len(adversarial_transcription) <= THRESHOLD
+    # num_empty_strings += len(adversarial_transcription) == 0
+    print(f"wers thus far is {wers}")
+    # wers.append(wer(original_transcription.lower().strip(), adversarial_transcription.lower().strip()))
+    # print(f"Original transcript: {original_transcription}")
+    # print(f"Adversarial transcript: {adversarial_transcription}")
+    # print(f"Avg WER thus far is {np.mean(wers)}")
 
-print("WERS were")
-print(np.mean(wers))
-print()
+for filter, filter_wers in wers.items():
+    plt.hist(filter_wers, density=True, bins=10)
+    plt.ylabel("Frequency")
+    plt.xlabel(f"WER of Patch-attacked Long Audio Samples with {filter} filter")
+    plt.savefig(f"WER{filter}.png")
+    print(f"average {filter} word error rate: {np.mean(filter_wers)}")
+    print()
 
-print(f"Number under threshold of {THRESHOLD} characters were")
-print(num_under_threshold)
-print()
+# print("WERS were")
+# print(np.mean(wers))
+# print()
 
-print("Number of empty transcriptions")
-print(num_empty_strings)
-print()
+# print(f"Number under threshold of {THRESHOLD} characters were")
+# print(num_under_threshold)
+# print()
+
+# print("Number of empty transcriptions")
+# print(num_empty_strings)
+# print()
 
 # wer(original_transcription.lower().strip(), adversarial_transcription.lower().strip()))
